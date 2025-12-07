@@ -103,3 +103,19 @@ jobs:
           echo "✅ All builds completed successfully!"
           echo "Frontend: ✅"
           echo "Backend: ✅"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js (Example for a Node project)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies (Example)
+        run: npm install
+      - name: Run the build command (Example)
+        run: npm run build
