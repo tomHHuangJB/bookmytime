@@ -1,0 +1,1017 @@
+Architecture Decision: PostgreSQL + OpenSearch
+Use Each Tool for Its Strengths:
+Tool	Primary Purpose	Best For	Not Good For
+PostgreSQL	Relational Data	Transactions, ACID compliance, complex queries, data integrity	Full-text search across millions of documents
+OpenSearch	Search & Analytics	Full-text search, fuzzy matching, aggregations, real-time analytics	Transactional data, complex joins, ACID compliance
+How They Work Together:
+text
+Client Request
+     ↓
+[Spring Boot Application]
+     ↓           ↓
+[PostgreSQL]   [OpenSearch]
+  (Primary DB)  (Search Index)
+     ↑              ↑
+  CRUD Ops      Search Ops
+     ↑              ↑
+[Data Sync via CDC]  (Change Data Capture)
+Complete Architecture Design
+Data Flow:
+Primary Storage: PostgreSQL for all transactional data
+
+Search Indexing: OpenSearch for searchable data (async via CDC)
+
+Read Operations:
+
+Complex queries → PostgreSQL
+
+Search operations → OpenSearch
+
+Write Operations: Always PostgreSQL first, then sync to OpenSearch
+
+1. Project Structure Update
+text
+bookmytime-java/
+├── backend/                    # Spring Boot Backend
+│   ├── src/main/java/com/bookmytime/
+│   │   ├── config/            # Configuration classes
+│   │   ├── controller/        # REST Controllers
+│   │   ├── service/           # Business logic
+│   │   ├── repository/        # JPA Repositories
+│   │   ├── model/             # JPA Entities
+│   │   ├── dto/               # Data Transfer Objects
+│   │   ├── search/            # OpenSearch integration
+│   │   │   ├── model/        # OpenSearch documents
+│   │   │   ├── repository/   # OpenSearch repositories
+│   │   │   └── sync/         # Sync services
+│   │   ├── security/          # Spring Security
+│   │   ├── event/             # Domain events
+│   │   └── BookMyTimeApplication.java
+│   ├── src/main/resources/
+│   │   ├── application.yml
+│   │   ├── application-dev.yml
+│   │   ├── application-prod.yml
+│   │   └── db/migration/      # Flyway migrations
+│   └── pom.xml
+├── frontend/                   # TypeScript Frontend (unchanged)
+├── docker-compose.yml         # Local development
+├── kubernetes/                # Production deployment
+└── README.md
+2. Docker Compose Setup
+yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: bookmytime
+      POSTGRES_USER: bookmytime
+      POSTGRES_PASSWORD: changeme123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/src/main/resources/db/migration:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookmytime"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # OpenSearch Cluster
+  opensearch:
+    image: opensearchproject/opensearch:2.11
+    environment:
+      - cluster.name=bookmytime-cluster
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - plugins.security.disabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
+  # OpenSearch Dashboards
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11
+    ports:
+      - "5601:5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+    depends_on:
+      - opensearch
+
+  # Debezium for Change Data Capture
+  debezium:
+    image: debezium/connect:2.3
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+    depends_on:
+      - postgres
+      - kafka
+
+  # Kafka (for CDC)
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  # Spring Boot Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      DB_HOST: postgres
+      OPENSEARCH_HOST: opensearch
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+
+volumes:
+  postgres_data:
+  opensearch_data:
+3. Spring Boot Application Setup
+pom.xml Dependencies
+xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    
+    <modelVersion>4.0.0</modelVersion>
+    
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.1.5</version>
+        <relativePath/>
+    </parent>
+    
+    <groupId>com.bookmytime</groupId>
+    <artifactId>bookmytime-backend</artifactId>
+    <version>1.0.0</version>
+    <name>BookMyTime Backend</name>
+    
+    <properties>
+        <java.version>17</java.version>
+        <opensearch.version>2.11.0</opensearch.version>
+        <testcontainers.version>1.19.1</testcontainers.version>
+    </properties>
+    
+    <dependencies>
+        <!-- Spring Boot Starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        
+        <!-- Database -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        
+        <!-- OpenSearch -->
+        <dependency>
+            <groupId>org.opensearch.client</groupId>
+            <artifactId>opensearch-java</artifactId>
+            <version>${opensearch.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-opensearch</artifactId>
+        </dependency>
+        
+        <!-- Kafka for CDC -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+        
+        <!-- Utilities -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct</artifactId>
+            <version>1.5.5.Final</version>
+        </dependency>
+        <dependency>
+            <groupId>org.mapstruct</groupId>
+            <artifactId>mapstruct-processor</artifactId>
+            <version>1.5.5.Final</version>
+            <scope>provided</scope>
+        </dependency>
+        
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>opensearch</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+4. Application Configuration
+application.yml
+yaml
+spring:
+  application:
+    name: bookmytime
+  
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/bookmytime
+    username: ${DB_USERNAME:bookmytime}
+    password: ${DB_PASSWORD:changeme123}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+    show-sql: ${SHOW_SQL:false}
+  
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+  
+  data:
+    opensearch:
+      uris: ${OPENSEARCH_HOST:http://localhost}:9200
+      username: ${OPENSEARCH_USERNAME:admin}
+      password: ${OPENSEARCH_PASSWORD:admin}
+      connection-timeout: 30s
+      socket-timeout: 30s
+  
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: bookmytime-cdc
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+# OpenSearch Configuration
+opensearch:
+  indices:
+    providers: providers_index
+    services: services_index
+    appointments: appointments_index
+  sync:
+    enabled: true
+    batch-size: 100
+    initial-delay: 30000
+    fixed-delay: 60000
+
+# Application Settings
+app:
+  security:
+    jwt:
+      secret: ${JWT_SECRET:your-256-bit-secret-key-here-change-in-production}
+      expiration: 86400000 # 24 hours
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+    allowed-methods: GET,POST,PUT,DELETE,OPTIONS
+    allowed-headers: "*"
+    allow-credentials: true
+  
+  # Rate limiting
+  rate-limit:
+    enabled: true
+    capacity: 100
+    refill-rate: 10
+    refill-duration: 1 # minutes
+
+# Logging
+logging:
+  level:
+    com.bookmytime: DEBUG
+    org.springframework.security: INFO
+    org.hibernate.SQL: ${SHOW_SQL:false}
+    org.hibernate.type.descriptor.sql.BasicBinder: ${SHOW_SQL:false}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+
+# Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+5. Database Schema Design (PostgreSQL)
+Flyway Migration V1
+sql
+-- V1__initial_schema.sql
+
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Users table
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    role VARCHAR(50) NOT NULL CHECK (role IN ('CLIENT', 'PROVIDER', 'ADMIN')),
+    email_verified BOOLEAN DEFAULT FALSE,
+    profile_image_url VARCHAR(500),
+    timezone VARCHAR(50) DEFAULT 'UTC',
+    locale VARCHAR(10) DEFAULT 'en-US',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP,
+    version INTEGER DEFAULT 0
+);
+
+-- Providers table (extends users)
+CREATE TABLE providers (
+    id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    bio TEXT,
+    headline VARCHAR(255),
+    hourly_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+    currency VARCHAR(3) DEFAULT 'USD',
+    years_experience INTEGER,
+    is_verified BOOLEAN DEFAULT FALSE,
+    verification_data JSONB,
+    rating DECIMAL(3,2) DEFAULT 0,
+    total_reviews INTEGER DEFAULT 0,
+    total_sessions INTEGER DEFAULT 0,
+    response_rate DECIMAL(5,2) DEFAULT 0,
+    response_time_minutes INTEGER,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Services table
+CREATE TABLE services (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider_id UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    category VARCHAR(100) NOT NULL,
+    subcategory VARCHAR(100),
+    duration_minutes INTEGER NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    is_active BOOLEAN DEFAULT TRUE,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_provider_service UNIQUE(provider_id, title)
+);
+
+-- Availability slots
+CREATE TABLE availability_slots (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider_id UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    timezone VARCHAR(50) NOT NULL,
+    is_available BOOLEAN DEFAULT TRUE,
+    service_id UUID REFERENCES services(id),
+    max_bookings INTEGER DEFAULT 1,
+    current_bookings INTEGER DEFAULT 0,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_slot UNIQUE(provider_id, date, start_time, end_time)
+);
+
+-- Appointments
+CREATE TABLE appointments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    client_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider_id UUID NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    slot_id UUID NOT NULL REFERENCES availability_slots(id),
+    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' 
+        CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'NO_SHOW')),
+    price DECIMAL(10,2) NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    client_notes TEXT,
+    provider_notes TEXT,
+    meeting_url VARCHAR(500),
+    meeting_platform VARCHAR(50),
+    cancellation_reason TEXT,
+    cancelled_by VARCHAR(50),
+    started_at TIMESTAMP,
+    ended_at TIMESTAMP,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    version INTEGER DEFAULT 0
+);
+
+-- Reviews
+CREATE TABLE reviews (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    appointment_id UUID NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+    reviewer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    reviewee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+    title VARCHAR(255),
+    comment TEXT,
+    is_verified BOOLEAN DEFAULT FALSE,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_appointment_review UNIQUE(appointment_id)
+);
+
+-- Payments
+CREATE TABLE payments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    appointment_id UUID NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+    amount DECIMAL(10,2) NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    status VARCHAR(50) NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'REFUNDED')),
+    payment_method VARCHAR(50),
+    payment_gateway VARCHAR(50),
+    transaction_id VARCHAR(255),
+    gateway_response JSONB,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Audit logs
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100) NOT NULL,
+    resource_id UUID,
+    details JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX idx_providers_verified ON providers(is_verified);
+CREATE INDEX idx_providers_rating ON providers(rating DESC);
+CREATE INDEX idx_services_provider ON services(provider_id);
+CREATE INDEX idx_services_category ON services(category);
+CREATE INDEX idx_availability_provider_date ON availability_slots(provider_id, date);
+CREATE INDEX idx_appointments_client ON appointments(client_id);
+CREATE INDEX idx_appointments_provider ON appointments(provider_id);
+CREATE INDEX idx_appointments_status ON appointments(status);
+CREATE INDEX idx_appointments_slot ON appointments(slot_id);
+CREATE INDEX idx_reviews_reviewee ON reviews(reviewee_id);
+CREATE INDEX idx_payments_appointment ON payments(appointment_id);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX idx_audit_logs_created ON audit_logs(created_at DESC);
+
+-- Create updated_at triggers
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_providers_updated_at BEFORE UPDATE ON providers
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_services_updated_at BEFORE UPDATE ON services
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_availability_updated_at BEFORE UPDATE ON availability_slots
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_appointments_updated_at BEFORE UPDATE ON appointments
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_reviews_updated_at BEFORE UPDATE ON reviews
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON payments
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+6. OpenSearch Index Templates
+Provider Index Template
+java
+// src/main/java/com/bookmytime/search/model/ProviderDocument.java
+package com.bookmytime.search.model;
+
+import lombok.Data;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.elasticsearch.annotations.*;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+@Data
+@Document(indexName = "providers", createIndex = true)
+@Setting(settingPath = "/opensearch/settings/providers-settings.json")
+@Mapping(mappingPath = "/opensearch/mappings/providers-mapping.json")
+public class ProviderDocument {
+    
+    @Id
+    private String id;
+    
+    @MultiField(
+        mainField = @Field(type = FieldType.Text, analyzer = "standard"),
+        otherFields = {
+            @InnerField(suffix = "keyword", type = FieldType.Keyword),
+            @InnerField(suffix = "autocomplete", type = FieldType.Text, analyzer = "autocomplete")
+        }
+    )
+    private String email;
+    
+    @Field(type = FieldType.Text, analyzer = "standard")
+    private String firstName;
+    
+    @Field(type = FieldType.Text, analyzer = "standard")
+    private String lastName;
+    
+    @Field(type = FieldType.Text, analyzer = "standard")
+    private String bio;
+    
+    @Field(type = FieldType.Text, analyzer = "standard")
+    private String headline;
+    
+    @Field(type = FieldType.Double)
+    private BigDecimal hourlyRate;
+    
+    @Field(type = FieldType.Keyword)
+    private String currency;
+    
+    @Field(type = FieldType.Integer)
+    private Integer yearsExperience;
+    
+    @Field(type = FieldType.Boolean)
+    private Boolean isVerified;
+    
+    @Field(type = FieldType.Double)
+    private BigDecimal rating;
+    
+    @Field(type = FieldType.Integer)
+    private Integer totalReviews;
+    
+    @Field(type = FieldType.Integer)
+    private Integer totalSessions;
+    
+    @Field(type = FieldType.Double)
+    private BigDecimal responseRate;
+    
+    @Field(type = FieldType.Integer)
+    private Integer responseTimeMinutes;
+    
+    @Field(type = FieldType.Keyword)
+    private List<String> languages;
+    
+    @Field(type = FieldType.Keyword)
+    private List<String> specialties;
+    
+    @Field(type = FieldType.Keyword)
+    private List<String> certifications;
+    
+    @Field(type = FieldType.Keyword)
+    private String timezone;
+    
+    @Field(type = FieldType.Keyword)
+    private String locale;
+    
+    @Field(type = FieldType.Object)
+    private Map<String, Object> metadata;
+    
+    @Field(type = FieldType.Date, format = DateFormat.epoch_millis)
+    private Instant createdAt;
+    
+    @Field(type = FieldType.Date, format = DateFormat.epoch_millis)
+    private Instant updatedAt;
+    
+    @Field(type = FieldType.GeoPoint)
+    private GeoPoint location;
+    
+    // For geo search
+    @Data
+    public static class GeoPoint {
+        private double lat;
+        private double lon;
+    }
+}
+OpenSearch Index Settings
+json
+// src/main/resources/opensearch/settings/providers-settings.json
+{
+  "analysis": {
+    "analyzer": {
+      "autocomplete": {
+        "type": "custom",
+        "tokenizer": "standard",
+        "filter": ["lowercase", "autocomplete_filter"]
+      },
+      "autocomplete_search": {
+        "type": "custom",
+        "tokenizer": "standard",
+        "filter": ["lowercase"]
+      }
+    },
+    "filter": {
+      "autocomplete_filter": {
+        "type": "edge_ngram",
+        "min_gram": 1,
+        "max_gram": 20
+      }
+    }
+  },
+  "index": {
+    "number_of_shards": 2,
+    "number_of_replicas": 1,
+    "refresh_interval": "1s"
+  }
+}
+OpenSearch Index Mappings
+json
+// src/main/resources/opensearch/mappings/providers-mapping.json
+{
+  "dynamic": "strict",
+  "properties": {
+    "id": { "type": "keyword" },
+    "email": {
+      "type": "text",
+      "fields": {
+        "keyword": { "type": "keyword" },
+        "autocomplete": {
+          "type": "text",
+          "analyzer": "autocomplete",
+          "search_analyzer": "autocomplete_search"
+        }
+      }
+    },
+    "firstName": { "type": "text" },
+    "lastName": { "type": "text" },
+    "bio": { "type": "text" },
+    "headline": { "type": "text" },
+    "hourlyRate": { "type": "double" },
+    "currency": { "type": "keyword" },
+    "yearsExperience": { "type": "integer" },
+    "isVerified": { "type": "boolean" },
+    "rating": { "type": "double" },
+    "totalReviews": { "type": "integer" },
+    "totalSessions": { "type": "integer" },
+    "responseRate": { "type": "double" },
+    "responseTimeMinutes": { "type": "integer" },
+    "languages": { "type": "keyword" },
+    "specialties": { "type": "keyword" },
+    "certifications": { "type": "keyword" },
+    "timezone": { "type": "keyword" },
+    "locale": { "type": "keyword" },
+    "metadata": { "type": "object", "enabled": true },
+    "createdAt": { "type": "date" },
+    "updatedAt": { "type": "date" },
+    "location": { "type": "geo_point" }
+  }
+}
+7. Data Sync Strategy (PostgreSQL → OpenSearch)
+Option 1: Change Data Capture (Debezium) - Recommended
+java
+// CDC Configuration
+@Configuration
+public class DebeziumConfig {
+    
+    @Bean
+    public io.debezium.config.Configuration providerConnector() {
+        return io.debezium.config.Configuration.create()
+            .with("connector.class", "io.debezium.connector.postgresql.PostgresConnector")
+            .with("offset.storage", "org.apache.kafka.connect.storage.FileOffsetBackingStore")
+            .with("offset.storage.file.filename", "/tmp/offsets.dat")
+            .with("offset.flush.interval.ms", 60000)
+            .with("name", "bookmytime-postgres-connector")
+            .with("database.hostname", "postgres")
+            .with("database.port", "5432")
+            .with("database.user", "bookmytime")
+            .with("database.password", "changeme123")
+            .with("database.dbname", "bookmytime")
+            .with("database.server.name", "bookmytime-db")
+            .with("table.include.list", "public.providers,public.services,public.users")
+            .with("plugin.name", "pgoutput")
+            .with("slot.name", "bookmytime_slot")
+            .with("publication.name", "bookmytime_publication")
+            .with("publication.autocreate.mode", "filtered")
+            .with("tombstones.on.delete", "false")
+            .build();
+    }
+}
+Option 2: Spring Batch Sync (Simpler)
+java
+// src/main/java/com/bookmytime/search/sync/OpenSearchSyncService.java
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class OpenSearchSyncService {
+    
+    private final ProviderRepository providerRepository;
+    private final ProviderSearchRepository providerSearchRepository;
+    private final ObjectMapper objectMapper;
+    
+    @Scheduled(fixedDelayString = "${opensearch.sync.fixed-delay:60000}", 
+               initialDelayString = "${opensearch.sync.initial-delay:30000}")
+    @Transactional(readOnly = true)
+    public void syncProvidersToOpenSearch() {
+        if (!syncEnabled) {
+            return;
+        }
+        
+        log.info("Starting provider sync to OpenSearch");
+        
+        Pageable pageable = PageRequest.of(0, batchSize, 
+            Sort.by(Sort.Direction.ASC, "updatedAt"));
+        
+        Page<Provider> providers = providerRepository
+            .findBySyncNeeded(true, pageable);
+        
+        List<ProviderDocument> documents = providers.stream()
+            .map(this::convertToDocument)
+            .collect(Collectors.toList());
+        
+        if (!documents.isEmpty()) {
+            providerSearchRepository.saveAll(documents);
+            log.info("Synced {} providers to OpenSearch", documents.size());
+        }
+    }
+    
+    private ProviderDocument convertToDocument(Provider provider) {
+        ProviderDocument doc = new ProviderDocument();
+        doc.setId(provider.getId().toString());
+        doc.setEmail(provider.getUser().getEmail());
+        doc.setFirstName(provider.getUser().getFirstName());
+        doc.setLastName(provider.getUser().getLastName());
+        doc.setBio(provider.getBio());
+        doc.setHeadline(provider.getHeadline());
+        doc.setHourlyRate(provider.getHourlyRate());
+        doc.setRating(provider.getRating());
+        doc.setTotalReviews(provider.getTotalReviews());
+        // ... map other fields
+        
+        return doc;
+    }
+}
+8. Search Service Implementation
+java
+// src/main/java/com/bookmytime/search/service/ProviderSearchService.java
+@Service
+@Slf4j
+@RequiredArgsConstructor
+public class ProviderSearchService {
+    
+    private final ProviderSearchRepository providerSearchRepository;
+    private final ObjectMapper objectMapper;
+    
+    public SearchResponse<ProviderDocument> searchProviders(ProviderSearchRequest request) {
+        NativeQueryBuilder queryBuilder = new NativeQueryBuilder();
+        
+        // Build bool query
+        BoolQuery.Builder boolQuery = new BoolQuery.Builder();
+        
+        // Full-text search across multiple fields
+        if (StringUtils.hasText(request.getQuery())) {
+            Query multiMatchQuery = MultiMatchQuery.of(m -> m
+                .query(request.getQuery())
+                .fields(
+                    "firstName^3",
+                    "lastName^3",
+                    "headline^2",
+                    "bio",
+                    "specialties",
+                    "languages"
+                )
+                .fuzziness("AUTO")
+            );
+            boolQuery.must(multiMatchQuery._toQuery());
+        }
+        
+        // Filter by specialties
+        if (!CollectionUtils.isEmpty(request.getSpecialties())) {
+            Query termsQuery = TermsQuery.of(t -> t
+                .field("specialties")
+                .terms(t2 -> t2.value(request.getSpecialties().stream()
+                    .map(FieldValue::of)
+                    .collect(Collectors.toList())))
+            );
+            boolQuery.filter(termsQuery._toQuery());
+        }
+        
+        // Filter by languages
+        if (!CollectionUtils.isEmpty(request.getLanguages())) {
+            Query termsQuery = TermsQuery.of(t -> t
+                .field("languages")
+                .terms(t2 -> t2.value(request.getLanguages().stream()
+                    .map(FieldValue::of)
+                    .collect(Collectors.toList())))
+            );
+            boolQuery.filter(termsQuery._toQuery());
+        }
+        
+        // Filter by price range
+        if (request.getMinPrice() != null || request.getMaxPrice() != null) {
+            RangeQuery.Builder rangeQuery = new RangeQuery.Builder()
+                .field("hourlyRate");
+            
+            if (request.getMinPrice() != null) {
+                rangeQuery.gte(JsonData.of(request.getMinPrice()));
+            }
+            if (request.getMaxPrice() != null) {
+                rangeQuery.lte(JsonData.of(request.getMaxPrice()));
+            }
+            
+            boolQuery.filter(rangeQuery.build()._toQuery());
+        }
+        
+        // Filter by rating
+        if (request.getMinRating() != null) {
+            Query rangeQuery = RangeQuery.of(r -> r
+                .field("rating")
+                .gte(JsonData.of(request.getMinRating()))
+            );
+            boolQuery.filter(rangeQuery._toQuery());
+        }
+        
+        // Filter by verified status
+        if (request.getVerifiedOnly() != null && request.getVerifiedOnly()) {
+            Query termQuery = TermQuery.of(t -> t
+                .field("isVerified")
+                .value(true)
+            );
+            boolQuery.filter(termQuery._toQuery());
+        }
+        
+        // Geo distance filter
+        if (request.getLocation() != null && request.getMaxDistance() != null) {
+            Query geoQuery = GeoDistanceQuery.of(g -> g
+                .field("location")
+                .distance(request.getMaxDistance() + "km")
+                .location(gl -> gl.latlon(ll -> ll
+                    .lat(request.getLocation().getLatitude())
+                    .lon(request.getLocation().getLongitude())
+                ))
+            );
+            boolQuery.filter(geoQuery._toQuery());
+        }
+        
+        // Build the query
+        Query finalQuery = boolQuery.build()._toQuery();
+        queryBuilder.withQuery(finalQuery);
+        
+        // Add sorting
+        if (StringUtils.hasText(request.getSortBy())) {
+            SortOptions sortOptions = SortOptions.of(s -> s
+                .field(f -> f
+                    .field(request.getSortBy())
+                    .order(SortOrder.Desc)
+                )
+            );
+            queryBuilder.withSort(sortOptions);
+        } else {
+            // Default: sort by relevance, then rating
+            queryBuilder.withSort(SortOptions.of(s -> s
+                .score(sc -> sc.order(SortOrder.Desc))
+            ));
+            queryBuilder.withSort(SortOptions.of(s -> s
+                .field(f -> f.field("rating").order(SortOrder.Desc))
+            ));
+        }
+        
+        // Pagination
+        queryBuilder.withPageable(PageRequest.of(
+            request.getPage(), 
+            request.getSize()
+        ));
+        
+        // Execute search
+        return providerSearchRepository.search(queryBuilder
