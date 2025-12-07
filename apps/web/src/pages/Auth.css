@@ -1,0 +1,121 @@
+.auth-page {
+  min-height: calc(100vh - 200px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.auth-container {
+  width: 100%;
+  max-width: 500px;
+}
+
+.auth-card {
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+.auth-subtitle {
+  color: var(--color-text-secondary, #4a5568);
+  font-size: 0.875rem;
+  margin-top: 0.5rem;
+  margin-bottom: 0;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.form-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--color-text, #2d3748);
+}
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--color-text, #2d3748);
+  padding: 0.75rem;
+  border: 1px solid var(--color-gray-200, #e2e8f0);
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+
+.radio-label:hover {
+  border-color: var(--color-primary, #667eea);
+  background-color: var(--color-gray-50, #f9fafb);
+}
+
+.radio-label input[type="radio"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.radio-label input[type="radio"]:checked + span {
+  font-weight: 600;
+  color: var(--color-primary, #667eea);
+}
+
+.auth-error {
+  padding: 0.75rem 1rem;
+  background-color: #fee;
+  border: 1px solid var(--color-danger, #e53e3e);
+  border-radius: 8px;
+  color: var(--color-danger, #e53e3e);
+  font-size: 0.875rem;
+}
+
+.auth-footer {
+  margin-top: 1.5rem;
+  text-align: center;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-gray-200, #e2e8f0);
+}
+
+.auth-footer p {
+  color: var(--color-text-secondary, #4a5568);
+  font-size: 0.875rem;
+  margin: 0;
+}
+
+.auth-link {
+  color: var(--color-primary, #667eea);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.auth-link:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 640px) {
+  .form-row {
+    grid-template-columns: 1fr;
+  }
+}
+
